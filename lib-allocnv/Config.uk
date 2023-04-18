@@ -1,0 +1,39 @@
+# Invisible option that is used to detect
+# if LIBALLOCNV is availbale for configuration
+config LIBALLOCNV_INCLUDED
+	   bool
+	   default y
+
+menuconfig LIBALLOCNV
+	   bool "allocnv - non-volatile memory language support"
+	   select LIBUKALLOC_IFMALLOC
+	   default n
+
+if LIBALLOCNV
+	config LIBALLOCNV_DISABLE_SPLIT
+		bool "Disable block splitting"
+		default n
+		help
+			If splitting is enabled, split blocks according to split
+			threshold.
+
+	config LIBALLOCNV_DISABLE_COMPACT
+		bool "Disable block compaction"
+		default n
+		help
+			If compaction is enabled, sort blocks into the free
+			list, merge if appropriate. Otherwise blocks are just
+			added as new head of the free list.
+
+	config LIBALLOCNV_HEAP_BLOCKS
+		int "Number of available heap blocks"
+		default 2048
+
+	config LIBALLOCNV_SPLIT_THRESH
+		int "Split threshold, in bytes"
+		default 16
+
+	config LIBALLOCNV_ALIGNMENT
+		int "Standard allocation alignment, in bytes"
+		default 8
+endif

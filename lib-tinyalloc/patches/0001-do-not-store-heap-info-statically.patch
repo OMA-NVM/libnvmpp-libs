@@ -1,0 +1,312 @@
+From: Hugo Lefeuvre <hugo.lefeuvre@neclab.eu>
+Subject: Adapt tinyalloc interface to Unikraft
+ - avoid statics: create a struct tinyalloc to store allocator metadata
+ - pass struct metadata as argument to allocation functions
+diff -urNp tinyalloc-orig/tinyalloc.c tinyalloc-patched/tinyalloc.c
+--- tinyalloc-orig/tinyalloc.c	2019-08-17 23:56:45.000000000 +0200
++++ tinyalloc-patched/tinyalloc.c	2020-06-30 10:34:24.945558078 +0200
+@@ -9,36 +9,16 @@ extern void print_i(size_t);
+ #define print_i(X)
+ #endif
+ 
+-typedef struct Block Block;
+-
+-struct Block {
+-    void *addr;
+-    Block *next;
+-    size_t size;
+-};
+-
+-typedef struct {
+-    Block *free;   // first free block
+-    Block *used;   // first used block
+-    Block *fresh;  // first available blank block
+-    size_t top;    // top free addr
+-    Block *blocks;
+-} Heap;
+-
+-static Heap *heap = NULL;
+-static void *heap_limit = NULL;
+-static size_t heap_split_thresh;
+-static size_t heap_alignment;
+-static size_t heap_max_blocks;
+-
+ /**
+  * If compaction is enabled, inserts block
+  * into free list, sorted by addr.
+  * If disabled, add block has new head of
+  * the free list.
+  */
+-static void insert_block(Block *block) {
+-#ifndef TA_DISABLE_COMPACT
++static void insert_block(struct tinyalloc *a, Block *block) {
++    Heap *heap = a->heap;
++
++#ifndef CONFIG_LIBTINYALLOC_DISABLE_COMPACT
+     Block *ptr  = heap->free;
+     Block *prev = NULL;
+     while (ptr != NULL) {
+@@ -66,8 +46,10 @@ static void insert_block(Block *block) {
+ #endif
+ }
+ 
+-#ifndef TA_DISABLE_COMPACT
+-static void release_blocks(Block *scan, Block *to) {
++#ifndef CONFIG_LIBTINYALLOC_DISABLE_COMPACT
++static void release_blocks(struct tinyalloc *a, Block *scan, Block *to) {
++    Heap *heap = a->heap;
++
+     Block *scan_next;
+     while (scan != to) {
+         print_s("release");
+@@ -81,7 +63,9 @@ static void release_blocks(Block *scan,
+     }
+ }
+ 
+-static void compact() {
++static void compact(struct tinyalloc *a) {
++    Heap *heap = a->heap;
++
+     Block *ptr = heap->free;
+     Block *prev;
+     Block *scan;
+@@ -103,7 +87,7 @@ static void compact() {
+             ptr->size   = new_size;
+             Block *next = prev->next;
+             // make merged blocks available
+-            release_blocks(ptr->next, prev->next);
++            release_blocks(a, ptr->next, prev->next);
+             // relink
+             ptr->next = next;
+         }
+@@ -112,30 +96,36 @@ static void compact() {
+ }
+ #endif
+ 
+-bool ta_init(const void *base, const void *limit, const size_t heap_blocks, const size_t split_thresh, const size_t alignment) {
+-    heap = (Heap *)base;
+-    heap_limit = limit;
+-    heap_split_thresh = split_thresh;
+-    heap_alignment = alignment;
+-    heap_max_blocks = heap_blocks;
++void ta_init(struct tinyalloc *a, const void *base, const void *limit,
++             const size_t heap_blocks, const size_t split_thresh,
++             const size_t alignment) {
++    Heap *heap;
++
++    a->heap = (Heap *)base;
++    a->heap_limit = limit;
++    a->heap_split_thresh = split_thresh;
++    a->heap_alignment = alignment;
++    a->heap_max_blocks = heap_blocks;
+ 
++    heap = a->heap;
+     heap->free   = NULL;
+     heap->used   = NULL;
++    heap->blocks = (Block*) ((size_t)base + sizeof(Heap));
+     heap->fresh  = heap->blocks;
+     heap->top    = (size_t)base + sizeof(Heap) + heap_blocks * sizeof(Block);
+-    heap->blocks = base + sizeof(Heap);
+ 
+     Block *block = heap->blocks;
+-    size_t i     = heap_max_blocks - 1;
++    size_t i     = a->heap_max_blocks - 1;
+     while (i--) {
+         block->next = block + 1;
+         block++;
+     }
+     block->next = NULL;
+-    return true;
+ }
+ 
+-bool ta_free(void *free) {
++void ta_free(struct tinyalloc *a, void *free) {
++    Heap *heap = a->heap;
++
+     Block *block = heap->used;
+     Block *prev  = NULL;
+     while (block != NULL) {
+@@ -145,25 +135,28 @@ bool ta_free(void *free) {
+             } else {
+                 heap->used = block->next;
+             }
+-            insert_block(block);
+-#ifndef TA_DISABLE_COMPACT
+-            compact();
++            insert_block(a, block);
++#ifndef CONFIG_LIBTINYALLOC_DISABLE_COMPACT
++            compact(a);
+ #endif
+-            return true;
++            return;
+         }
+         prev  = block;
+         block = block->next;
+     }
+-    return false;
++    return;
+ }
+ 
+-static Block *alloc_block(size_t num) {
++static Block *alloc_block(struct tinyalloc *a, size_t num) {
++    Heap *heap = a->heap;
++
+     Block *ptr  = heap->free;
+     Block *prev = NULL;
+     size_t top  = heap->top;
+-    num         = (num + heap_alignment - 1) & -heap_alignment;
++    num         = (num + a->heap_alignment - 1) & - a->heap_alignment;
+     while (ptr != NULL) {
+-        const int is_top = ((size_t)ptr->addr + ptr->size >= top) && ((size_t)ptr->addr + num <= heap_limit);
++        const int is_top = ((size_t)ptr->addr + ptr->size >= top)
++		        && ((size_t)ptr->addr + num <= a->heap_limit);
+         if (is_top || ptr->size >= num) {
+             if (prev != NULL) {
+                 prev->next = ptr->next;
+@@ -176,10 +169,10 @@ static Block *alloc_block(size_t num) {
+                 print_s("resize top block");
+                 ptr->size = num;
+                 heap->top = (size_t)ptr->addr + num;
+-#ifndef TA_DISABLE_SPLIT
++#ifndef CONFIG_LIBTINYALLOC_DISABLE_SPLIT
+             } else if (heap->fresh != NULL) {
+                 size_t excess = ptr->size - num;
+-                if (excess >= heap_split_thresh) {
++                if (excess >= a->heap_split_thresh) {
+                     ptr->size    = num;
+                     Block *split = heap->fresh;
+                     heap->fresh  = split->next;
+@@ -187,9 +180,9 @@ static Block *alloc_block(size_t num) {
+                     print_s("split");
+                     print_i((size_t)split->addr);
+                     split->size = excess;
+-                    insert_block(split);
+-#ifndef TA_DISABLE_COMPACT
+-                    compact();
++                    insert_block(a, split);
++#ifndef CONFIG_LIBTINYALLOC_DISABLE_COMPACT
++                    compact(a);
+ #endif
+                 }
+ #endif
+@@ -199,10 +192,11 @@ static Block *alloc_block(size_t num) {
+         prev = ptr;
+         ptr  = ptr->next;
+     }
++
+     // no matching free blocks
+     // see if any other blocks available
+     size_t new_top = top + num;
+-    if (heap->fresh != NULL && new_top <= heap_limit) {
++    if (heap->fresh != NULL && new_top <= (size_t)a->heap_limit) {
+         ptr         = heap->fresh;
+         heap->fresh = ptr->next;
+         ptr->addr   = (void *)top;
+@@ -212,11 +206,12 @@ static Block *alloc_block(size_t num) {
+         heap->top   = new_top;
+         return ptr;
+     }
++
+     return NULL;
+ }
+ 
+-void *ta_alloc(size_t num) {
+-    Block *block = alloc_block(num);
++void *ta_alloc(struct tinyalloc *a, size_t num) {
++    Block *block = alloc_block(a, num);
+     if (block != NULL) {
+         return block->addr;
+     }
+@@ -236,9 +231,9 @@ static void memclear(void *ptr, size_t n
+     }
+ }
+ 
+-void *ta_calloc(size_t num, size_t size) {
++void *ta_calloc(struct tinyalloc *a, size_t num, size_t size) {
+     num *= size;
+-    Block *block = alloc_block(num);
++    Block *block = alloc_block(a, num);
+     if (block != NULL) {
+         memclear(block->addr, num);
+         return block->addr;
+@@ -255,18 +250,21 @@ static size_t count_blocks(Block *ptr) {
+     return num;
+ }
+ 
+-size_t ta_num_free() {
++size_t ta_num_free(struct tinyalloc *a) {
++    Heap *heap = a->heap;
+     return count_blocks(heap->free);
+ }
+ 
+-size_t ta_num_used() {
++size_t ta_num_used(struct tinyalloc *a) {
++    Heap *heap = a->heap;
+     return count_blocks(heap->used);
+ }
+ 
+-size_t ta_num_fresh() {
++size_t ta_num_fresh(struct tinyalloc *a) {
++    Heap *heap = a->heap;
+     return count_blocks(heap->fresh);
+ }
+ 
+-bool ta_check() {
+-    return heap_max_blocks == ta_num_free() + ta_num_used() + ta_num_fresh();
++bool ta_check(struct tinyalloc *a) {
++    return a->heap_max_blocks == ta_num_free(a) + ta_num_used(a) + ta_num_fresh(a);
+ }
+diff -urNp tinyalloc-orig/tinyalloc.h tinyalloc-patched/tinyalloc.h
+--- tinyalloc-orig/tinyalloc.h	2019-08-17 23:56:45.000000000 +0200
++++ tinyalloc-patched/tinyalloc.h	2020-06-30 10:38:59.734724059 +0200
+@@ -1,12 +1,41 @@
+ #include <stdbool.h>
+ #include <stddef.h>
+ 
+-bool ta_init(const void *base, const void *limit, const size_t heap_blocks, const size_t split_thresh, const size_t alignment);
+-void *ta_alloc(size_t num);
+-void *ta_calloc(size_t num, size_t size);
+-bool ta_free(void *ptr);
+-
+-size_t ta_num_free();
+-size_t ta_num_used();
+-size_t ta_num_fresh();
+-bool ta_check();
++typedef struct Block Block;
++
++struct Block {
++    void *addr;
++    Block *next;
++    size_t size;
++};
++
++typedef struct {
++    Block *free;   // first free block
++    Block *used;   // first used block
++    Block *fresh;  // first available blank block
++    size_t top;    // top free addr
++    Block *blocks;
++} Heap;
++
++struct tinyalloc {
++    Heap *heap;
++    void *heap_limit;
++    size_t heap_split_thresh;
++    size_t heap_alignment;
++    size_t heap_max_blocks;
++};
++
++void ta_init(struct tinyalloc *a, const void *base, const void *limit,
++             const size_t heap_blocks, const size_t split_thresh,
++             const size_t alignment);
++
++void *ta_alloc(struct tinyalloc *a, size_t num);
++void *ta_calloc(struct tinyalloc *a, size_t num, size_t size);
++void  ta_free(struct tinyalloc *a, void *ptr);
++int   ta_posix_memalign(struct tinyalloc *a, void **memptr, size_t align,
++			size_t size);
++
++size_t ta_num_free(struct tinyalloc *a);
++size_t ta_num_used(struct tinyalloc *a);
++size_t ta_num_fresh(struct tinyalloc *a);
++bool   ta_check(struct tinyalloc *a);
